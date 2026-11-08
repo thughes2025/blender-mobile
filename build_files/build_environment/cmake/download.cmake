@@ -52,7 +52,20 @@ function(download_source dep)
     file(SIZE ${TARGET_FILE} TARGET_SIZE)
     if(${TARGET_SIZE} EQUAL 0)
       file(REMOVE ${TARGET_FILE})
-      message(FATAL_ERROR "for ${TARGET_FILE} file size 0, download likely failed, deleted...")
+      message(WARNING "Download from ${TARGET_URI} resulted in 0-byte file, trying Blender official mirror...")
+      set(FALLBACK_URI "https://projects.blender.org/blender/lib-source/media/branch/main/${${dep}_FILE}")
+      file(
+        DOWNLOAD ${FALLBACK_URI} ${TARGET_FILE}
+        TIMEOUT 1800
+        EXPECTED_HASH ${TARGET_HASH_TYPE}=${TARGET_HASH}
+        TLS_VERIFY ON
+        SHOW_PROGRESS
+      )
+      file(SIZE ${TARGET_FILE} TARGET_SIZE)
+      if(${TARGET_SIZE} EQUAL 0)
+        file(REMOVE ${TARGET_FILE})
+        message(FATAL_ERROR "for ${TARGET_FILE} file size 0, download likely failed, deleted...")
+      endif()
     endif()
 
     # If we are using sources from the blender repo also
