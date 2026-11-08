@@ -1,0 +1,136 @@
+diff -Naur ispc-1.17.0.org/cmake/GenerateBuiltins.cmake ispc-1.17.0/cmake/GenerateBuiltins.cmake
+--- ispc-1.17.0.org/cmake/GenerateBuiltins.cmake	2022-01-15 01:35:15 -0700
++++ ispc-1.17.0/cmake/GenerateBuiltins.cmake	2022-02-12 12:44:24 -0700
+@@ -271,6 +271,8 @@
+ 
+     if ("${bit}" STREQUAL "32" AND ${generic_arch} STREQUAL "x86")
+         set(arch "i686")
++		  # Blender: disable 32bit due to build issues on Linux and being unnecessary.
++        set(SKIP ON)
+     elseif ("${bit}" STREQUAL "64" AND ${generic_arch} STREQUAL "x86")
+         set(arch "x86_64")
+     elseif ("${bit}" STREQUAL "32" AND ${generic_arch} STREQUAL "arm")
+
+--- a/CMakeLists.txt	2024-02-04 22:12:13
++++ b/CMakeLists.txt	2024-02-05 09:54:41
+@@ -119,6 +119,29 @@
+     set(ISPC_LIBRARY_JIT OFF CACHE BOOL "Build ISPC as a library with JIT capabilities" FORCE)
+ endif()
+ 
++# Link against libstdc++.a which must be provided to the linker after
++# LLVM and CLang libraries.
++# This is needed because some of LLVM/CLang dependencies are using
++# std::make_shared, which is defined in one of those:
++#  - libclang-cpp.so
++#  - libstdc++.a
++# Using the former one is tricky because then generated binary depends
++# on a library which is outside of the LD_LIBRARY_PATH.
++#
++# Hence, using C++ implementation from G++ which seems to work just fine.
++# In fact, from investigation seems that libclang-cpp.so itself is pulling
++# std::_Sp_make_shared_tag from G++'s libstdc++.a.
++if(UNIX AND NOT APPLE)
++    execute_process(
++        COMMAND g++ --print-file-name libstdc++.a
++        OUTPUT_VARIABLE GCC_LIBSTDCXX_A
++        OUTPUT_STRIP_TRAILING_WHITESPACE
++    )
++    if(GCC_LIBSTDCXX_A AND EXISTS ${GCC_LIBSTDCXX_A})
++        target_link_libraries(${PROJECT_NAME} ${GCC_LIBSTDCXX_A})
++    endif()
++endif()
++
+ # Build target for utility checking host ISA
+ # This target should be defined before the inclusion of FindLLVM.cmake because
+ # we want to build check_isa without LLVM installed.
+@@ -669,7 +692,7 @@
+ 
+ # Include directories
+ list(APPEND INCLUDE_DIRECTORIES
+-    ${LLVM_INCLUDE_DIRS}
++    ${LLVM_INCLUDE_DIRS}  ${CLANG_INCLUDE_DIRS}
+     ${XE_DEPS_DIR}/include
+     ${CMAKE_CURRENT_SOURCE_DIR}/src
+     ${CMAKE_CURRENT_SOURCE_DIR}/src/include
+@@ -791,12 +814,12 @@
+     endif()
+ endif()
+ 
+-if (ISPC_STATIC_STDCXX_LINK OR ISPC_STATIC_LINK)
+-    list(APPEND LINK_OPTIONS_PUBLIC
+-        -static-libgcc
+-        -static-libstdc++
+-    )
+-endif()
++#if (ISPC_STATIC_STDCXX_LINK OR ISPC_STATIC_LINK)
++#    list(APPEND LINK_OPTIONS_PUBLIC
++#        -static-libgcc
++#        -static-libstdc++
++#    )
++#endif()
+ 
+ if (ISPC_USE_ASAN)
+     list(APPEND LINK_OPTIONS_PUBLIC -fsanitize=address)
+@@ -996,6 +1019,20 @@
+     add_ispc_slim(ispc-slim)
+     configure_ispc_obj(generic-target)
+
++     set_target_properties(ispc-slim PROPERTIES
++        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin"
++     )
++
++    if(DEFINED ISPC_HOST_SLIM_BINARY AND EXISTS "${ISPC_HOST_SLIM_BINARY}")
++        add_custom_command(TARGET ispc-slim POST_BUILD
++            COMMAND ${CMAKE_COMMAND} -E rm -f $<TARGET_FILE:ispc-slim>
++            COMMAND ${CMAKE_COMMAND} -E copy
++                ${ISPC_HOST_SLIM_BINARY}
++                $<TARGET_FILE:ispc-slim>
++            COMMENT "Replacing iOS ispc-slim with darwin host binary"
++        )
++    endif()
++
+     add_executable(ispc src/main.cpp src/binary_composite.cpp)
+     configure_ispc_exe(ispc)
+     target_link_libraries(ispc ${LINK_LIBRARIES} builtin stdlib optimization common frontend generic-target)
+
+--- a/src/ispc_version.h	2023-06-17 02:10:13
++++ b/src/ispc_version.h	2023-06-17 11:25:26
+@@ -24,6 +24,14 @@
+ #define OLDEST_SUPPORTED_LLVM ISPC_LLVM_18_1
+ #define LATEST_SUPPORTED_LLVM ISPC_LLVM_22_0
+ 
++
++#undef LLVM_VERSION_MAJOR
++#undef LLVM_VERSION_MINOR
++#undef LLVM_VERSION_PATCH
++#define LLVM_VERSION_MAJOR 20
++#define LLVM_VERSION_MINOR 1
++#define LLVM_VERSION_PATCH 8
++
+ #ifdef __ispc__xstr
+ #undef __ispc__xstr
+ #endif
+
+--- a/cmake/Stdlib.cmake
++++ b/cmake/Stdlib.cmake
+@@ -55,7 +55,7 @@
+ 
+     add_custom_command(
+         OUTPUT ${bc}
+-        COMMAND ${ispc_name} -I ${SRC_INCLUDE_FOLDER} --nostdlib --gen-stdlib --target=${target_for_file} --arch=${canon_arch} --target-os=${canon_os} stdlib/stdlib.ispc --emit-llvm -o ${bc}
++        COMMAND $<TARGET_FILE:${ispc_name}> -I ${SRC_INCLUDE_FOLDER} --nostdlib --gen-stdlib --target=${target_for_file} --arch=${canon_arch} --target-os=${canon_os} stdlib/stdlib.ispc --emit-llvm -o ${bc}
+         DEPENDS ${ispc_name} ${STDLIB_ISPC_FILES}
+         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+     )
+
+--- a/cmake/CommonStdlibBuiltins.cmake
++++ b/cmake/CommonStdlibBuiltins.cmake
+@@ -198,7 +198,7 @@
+     # Generate bitcode
+     add_custom_command(
+         OUTPUT ${bc}
+-        COMMAND ${ispc_name} -I ${include} --enable-llvm-intrinsics --nostdlib --gen-stdlib
++        COMMAND $<TARGET_FILE:${ispc_name}> -I ${include} --enable-llvm-intrinsics --nostdlib --gen-stdlib
+                 --target=${target} --arch=${arch} --target-os=${fixed_os} --emit-llvm
+                 -o ${bc} ${input_ispc} -DBUILD_OS=${OS_UP} -DRUNTIME=${bit}
+         DEPENDS ${ispc_name} ${input_ispc}

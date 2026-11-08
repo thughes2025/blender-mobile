@@ -1,0 +1,407 @@
+--- a/Modules/posixmodule.c	2022-12-09 21:44:03
++++ b/Modules/posixmodule.c	2022-12-09 21:39:46
+@@ -10564,10 +10564,15 @@
+         Py_BEGIN_ALLOW_THREADS
+ #ifdef HAVE_MKFIFOAT
+         if (dir_fd != DEFAULT_DIR_FD) {
++// BLENDER: disable also at compile time for compatibility when linking with older Xcode.
++// https://github.com/python/cpython/issues/97897
++#ifndef __APPLE__
+             if (HAVE_MKFIFOAT_RUNTIME) {
+                 result = mkfifoat(dir_fd, path->narrow, mode);
+ 
++            } else
++#endif
++            {
+-            } else {
+                 mkfifoat_unavailable = 1;
+                 result = 0;
+             }
+@@ -10638,10 +10633,15 @@
+         Py_BEGIN_ALLOW_THREADS
+ #ifdef HAVE_MKNODAT
+         if (dir_fd != DEFAULT_DIR_FD) {
++// BLENDER: disable also at compile time for compatibility when linking with older Xcode.
++// https://github.com/python/cpython/issues/97897
++#ifndef __APPLE__
+             if (HAVE_MKNODAT_RUNTIME) {
+                 result = mknodat(dir_fd, path->narrow, mode, device);
+ 
++            } else
++#endif
++            {
+-            } else {
+                 mknodat_unavailable = 1;
+                 result = 0;
+             }
+
+--- a/configure	2023-06-14 10:39:22
++++ b/configure	2023-06-14 11:05:42
+@@ -1131,6 +1131,7 @@
+ with_ssl_default_suites
+ with_builtin_hashlib_hashes
+ enable_test_modules
++with_force_crosscompile
+ '
+       ac_precious_vars='build_alias
+ host_alias
+@@ -1648,6 +1649,22 @@
+   fi
+ fi
+ 
++# Force enable cross-compilation to take crosscompile path even if host and build are the same.
++{ $as_echo_n "checking for --with-force-crosscompile... " >&6; }
++
++if test "${with_force_crosscompile+set}" = set; then
++  withval=$with_force_crosscompile
++else
++  withval="no"
++fi
++
++if test "$withval" != no; then
++  { $as_echo "yes" >&6; }
++  cross_compiling=yes
++else
++  { $as_echo "no" >&6; }
++fi
++
+ ac_tool_prefix=
+ test -n "$host_alias" && ac_tool_prefix=$host_alias-
+ 
+@@ -4067,6 +4084,9 @@
+ 	*-*-wasi*)
+ 	    ac_sys_system=WASI
+ 	    ;;
++    *-apple-darwin*)
++        ac_sys_system=Darwin
++        ;;
+ 	*)
+ 		# for now, limit cross builds to known configurations
+ 		MACHDEP="unknown"
+@@ -4531,7 +4551,10 @@
+ 	wasm32-*-* | wasm64-*-*)
+ 		_host_ident=$host_cpu
+ 		;;
+-	*)
++    *-apple-darwin*)
++        _host_ident=arm
++        ;;
++    *)
+ 		# for now, limit cross builds to known configurations
+ 		MACHDEP="unknown"
+ 		as_fn_error $? "cross build not supported for $host" "$LINENO" 5
+@@ -14432,7 +14455,14 @@
+ 
+ 
+ 
++if test "x$ac_sys_system" = xDarwin && test "$cross_compiling" = yes
++then :
++    ac_cv_func_ffi_prep_cif_var=yes
++    ac_cv_func_ffi_prep_closure_loc=yes
++    ac_cv_func_ffi_closure_alloc=yes
++fi
+ 
++
+ have_libffi=missing
+ if test "x$ac_sys_system" = xDarwin
+ then :
+@@ -14483,7 +14513,7 @@
+ fi
+ { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_ffi_ffi_call" >&5
+ printf "%s\n" "$ac_cv_lib_ffi_ffi_call" >&6; }
+-if test "x$ac_cv_lib_ffi_ffi_call" = xyes
++if test "x$ac_cv_lib_ffi_ffi_call" = xyes && test "$cross_compiling" = no
+ then :
+ 
+                 have_libffi=yes
+@@ -28823,14 +28853,14 @@
+ printf "%s\n" "no" >&6; }
+ 	have_libb2=no
+ else
+-	LIBB2_CFLAGS=$pkg_cv_LIBB2_CFLAGS
+-	LIBB2_LIBS=$pkg_cv_LIBB2_LIBS
++	LIBB2_CFLAGS=
++	LIBB2_LIBS=
+         { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+ printf "%s\n" "yes" >&6; }
+ 
+-    have_libb2=yes
++    have_libb2=no
+ 
+-printf "%s\n" "#define HAVE_LIBB2 1" >>confdefs.h
++#printf "%s\n" "#define HAVE_LIBB2 1" >>confdefs.h
+ 
+ 
+ fi
+
+--- a/Modules/posixmodule.c	2023-03-20 15:29:29
++++ b/Modules/posixmodule.c	2023-06-14 14:36:27
+@@ -395,6 +395,15 @@
+ #  define fsync _commit
+ #endif  /* ! __WATCOMC__ || __QNX__ */
+ 
++#ifdef __APPLE__
++#  if TARGET_OS_IOS
++#    undef HAVE_SYSTEM
++#    undef HAVE_SENDFILE
++#  else
++#    define HAVE_SYSTEM 1
++#  endif
++#endif
++
+ /*[clinic input]
+ # one of the few times we lie about this name!
+ module os
+
+--- a/Modules/Setup	2023-07-27 15:15:02
++++ b/Modules/Setup	2023-07-27 15:16:13
+@@ -129,78 +129,81 @@
+ #*shared*
+ 
+ # Modules that should always be present (POSIX and Windows):
++*static*
++_asyncio _asynciomodule.c
++_bisect _bisectmodule.c
++_contextvars _contextvarsmodule.c
++_csv _csv.c
++_datetime _datetimemodule.c
++_decimal _decimal/_decimal.c -I$(srcdir)/Modules/_decimal/libmpdec Modules/_decimal/libmpdec/libmpdec.a
++_heapq _heapqmodule.c
++_interpchannels _interpchannelsmodule.c
++_interpqueues _interpqueuesmodule.c
++_interpreters _interpretersmodule.c
++_json _json.c
++_lsprof _lsprof.c rotatingtree.c
++_multiprocessing -I$(srcdir)/Modules/_multiprocessing _multiprocessing/multiprocessing.c _multiprocessing/semaphore.c
++_opcode _opcode.c
++_pickle _pickle.c
++_queue _queuemodule.c
++_random _randommodule.c
++_socket socketmodule.c
++_statistics _statisticsmodule.c
++_struct _struct.c
++_typing _typingmodule.c
++_zoneinfo _zoneinfo.c
++array arraymodule.c
++binascii binascii.c
++cmath cmathmodule.c _math.c
++math mathmodule.c _math.c
++mmap mmapmodule.c
++select selectmodule.c
++_sysconfig _sysconfig.c
+ 
+-#_asyncio _asynciomodule.c
+-#_bisect _bisectmodule.c
+-#_contextvars _contextvarsmodule.c
+-#_csv _csv.c
+-#_datetime _datetimemodule.c
+-#_decimal _decimal/_decimal.c
+-#_heapq _heapqmodule.c
+-#_interpchannels _interpchannelsmodule.c
+-#_interpqueues _interpqueuesmodule.c
+-#_interpreters _interpretersmodule.c
+-#_json _json.c
+-#_lsprof _lsprof.c rotatingtree.c
+-#_multiprocessing -I$(srcdir)/Modules/_multiprocessing _multiprocessing/multiprocessing.c _multiprocessing/semaphore.c
+-#_opcode _opcode.c
+-#_pickle _pickle.c
+-#_queue _queuemodule.c
+-#_random _randommodule.c
+-#_socket socketmodule.c
+-#_statistics _statisticsmodule.c
+-#_struct _struct.c
+-#_typing _typingmodule.c
+-#_zoneinfo _zoneinfo.c
+-#array arraymodule.c
+-#binascii binascii.c
+-#cmath cmathmodule.c
+-#math mathmodule.c
+-#mmap mmapmodule.c
+-#select selectmodule.c
+-#_sysconfig _sysconfig.c
+-
+ # XML
+-#_elementtree _elementtree.c
+-#pyexpat pyexpat.c
++*static*
++_elementtree _elementtree.c
++pyexpat pyexpat.c
+ 
+ # hashing builtins
+-#_blake2 _blake2/blake2module.c _blake2/blake2b_impl.c _blake2/blake2s_impl.c
+-#_md5 md5module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_MD5.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
+-#_sha1 sha1module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_SHA1.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
+-#_sha2 sha2module.c -I$(srcdir)/Modules/_hacl/include Modules/_hacl/libHacl_Hash_SHA2.a
+-#_sha3 sha3module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_SHA3.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
++*static*
++_blake2 _blake2/blake2module.c _blake2/blake2b_impl.c _blake2/blake2s_impl.c
++_md5 md5module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_MD5.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
++_sha1 sha1module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_SHA1.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
++_sha2 sha2module.c -I$(srcdir)/Modules/_hacl/include Modules/_hacl/libHacl_Hash_SHA2.a
++_sha3 sha3module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_SHA3.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
+ 
+ # text encodings and unicode
+-#_codecs_cn cjkcodecs/_codecs_cn.c
+-#_codecs_hk cjkcodecs/_codecs_hk.c
+-#_codecs_iso2022 cjkcodecs/_codecs_iso2022.c
+-#_codecs_jp cjkcodecs/_codecs_jp.c
+-#_codecs_kr cjkcodecs/_codecs_kr.c
+-#_codecs_tw cjkcodecs/_codecs_tw.c
+-#_multibytecodec cjkcodecs/multibytecodec.c
+-#unicodedata unicodedata.c
++*static*
++_codecs_cn cjkcodecs/_codecs_cn.c
++_codecs_hk cjkcodecs/_codecs_hk.c
++_codecs_iso2022 cjkcodecs/_codecs_iso2022.c
++_codecs_jp cjkcodecs/_codecs_jp.c
++_codecs_kr cjkcodecs/_codecs_kr.c
++_codecs_tw cjkcodecs/_codecs_tw.c
++_multibytecodec cjkcodecs/multibytecodec.c
++unicodedata unicodedata.c
+ 
+ # Modules with some UNIX dependencies
+-
+-#_posixsubprocess _posixsubprocess.c
++*static*
++_posixsubprocess _posixsubprocess.c
+-#_posixshmem -I$(srcdir)/Modules/_multiprocessing _multiprocessing/posixshmem.c -lrt
+-#fcntl fcntlmodule.c
+-#grp grpmodule.c
+-#resource resource.c
+-#syslog syslogmodule.c
+-#termios termios.c
++_posixshmem _multiprocessing/posixshmem.c
++fcntl fcntlmodule.c
++grp grpmodule.c
++resource resource.c
++syslog syslogmodule.c
++termios termios.c
+ 
+ # Modules that require external libraries.
+-
+-#_bz2 _bz2module.c -lbz2
++*static*
++_bz2 _bz2module.c -lbz2
+ #_ctypes _ctypes/_ctypes.c _ctypes/callbacks.c _ctypes/callproc.c _ctypes/stgdict.c _ctypes/cfield.c -ldl -lffi -DHAVE_FFI_PREP_CIF_VAR -DHAVE_FFI_PREP_CLOSURE_LOC -DHAVE_FFI_CLOSURE_ALLOC
+ # The _dbm module supports NDBM, GDBM with compat module, and Berkeley DB.
+ #_dbm _dbmmodule.c -lgdbm_compat -DUSE_GDBM_COMPAT
+ #_gdbm _gdbmmodule.c -lgdbm
+-#_lzma _lzmamodule.c -llzma
+-#_uuid _uuidmodule.c -luuid
+-#zlib  zlibmodule.c -lz
++_lzma _lzmamodule.c -llzma
++_uuid _uuidmodule.c -luuid
++zlib  zlibmodule.c -lz
+ 
+ # The readline module also supports libeditline (-leditline).
+ # Some systems may require -ltermcap or -ltermlib.
+@@ -216,6 +219,12 @@
+ #     -l:libcrypto.a -Wl,--exclude-libs,libcrypto.a
+ # _hashlib _hashopenssl.c $(OPENSSL_INCLUDES) $(OPENSSL_LDFLAGS) \
+ #     -l:libcrypto.a -Wl,--exclude-libs,libcrypto.a
++*static*
++_ssl _ssl.c \
++     -lssl -lcrypto
++_hashlib _hashopenssl.c \
++     -I$(OPENSSL)/include -L$(OPENSSL)/lib \
++     -lcrypto
+ 
+ # The _tkinter module.
+ #
+@@ -266,14 +275,14 @@
+ # _scproxy _scproxy.c
+ 
+ # Examples
+-
++*static*
+ #xx xxmodule.c
+-#xxlimited xxlimited.c
+-#xxlimited_35 xxlimited_35.c
+-#xxsubtype xxsubtype.c
++xxlimited xxlimited.c
++xxlimited_35 xxlimited_35.c
++xxsubtype xxsubtype.c
+
+ # Testing
+-
++*static*
+ #_xxtestfuzz _xxtestfuzz/_xxtestfuzz.c _xxtestfuzz/fuzzer.c
+ #_testbuffer _testbuffer.c
+ #_testinternalcapi _testinternalcapi.c
+@@ -294,6 +303,8 @@
+ #
+-#*disabled*
++*disabled*
+ #
+-# _sqlite3 _tkinter _curses pyexpat
+-# _codecs_jp _codecs_kr _codecs_tw unicodedata
++#_curses _curses_panel _cursesmodule
++*static*
++_sqlite3 _tkinter pyexpat
++_codecs_jp _codecs_kr _codecs_tw unicodedata
+
+diff --git a/Modules/_scproxy.c b/Modules/_scproxy.c
+index 4c1f1aa..92ed82c 100644
+--- a/Modules/_scproxy.c
++++ b/Modules/_scproxy.c
+@@ -55,6 +55,9 @@ cfstring_to_pystring(CFStringRef ref)
+ static PyObject*
+ get_proxy_settings(PyObject* Py_UNUSED(mod), PyObject *Py_UNUSED(ignored))
+ {
++#if defined(__APPLE__)
++  return PyDict_New();
++#else
+     CFDictionaryRef proxyDict = NULL;
+     CFNumberRef aNum = NULL;
+     CFArrayRef anArray = NULL;
+@@ -125,6 +128,7 @@ error:
+     if (proxyDict)  CFRelease(proxyDict);
+     Py_XDECREF(result);
+     return NULL;
++#endif
+ }
+
+ static int
+@@ -171,6 +175,9 @@ set_proxy(PyObject* proxies, const char* proto, CFDictionaryRef proxyDict,
+ static PyObject*
+ get_proxies(PyObject* Py_UNUSED(mod), PyObject *Py_UNUSED(ignored))
+ {
++#if defined(__APPLE__)
++  return PyDict_New();
++#else
+     PyObject* result = NULL;
+     int r;
+     CFDictionaryRef proxyDict = NULL;
+@@ -213,6 +220,7 @@ error:
+     if (proxyDict)  CFRelease(proxyDict);
+     Py_XDECREF(result);
+     return NULL;
++#endif
+ }
+
+ static PyMethodDef mod_methods[] = {
+diff --git a/Modules/Setup.bak b/Modules/Setup
+index 019fb4a..1ec0592 100644
+--- a/Modules/Setup.bak
++++ b/Modules/Setup
+@@ -280,7 +280,8 @@ _hashlib _hashopenssl.c \
+ #_curses_panel -lpanel -lncurses _curses_panel.c
+
+ # macOS specific module, needs SystemConfiguration and CoreFoundation framework
+-# _scproxy _scproxy.c
++*static*
++_scproxy _scproxy.c
+
+ # Examples
+ *static*
+--- a/Makefile.pre.in
++++ b/Makefile.pre.in
+@@ -503,7 +503,10 @@ LIBRARY_OBJS=	\
+ 		$(LIBRARY_OBJS_OMIT_FROZEN) \
+ 		$(DEEPFREEZE_OBJS) \
+ 		Modules/getpath.o \
+-		Python/frozen.o
++		Python/frozen.o \
++		$(LIBMPDEC_OBJS) \
++       $(LIBHACL_SHA2_OBJS) \
++       $(LIBEXPAT_OBJS)

@@ -1,0 +1,184 @@
+name: iOS TestFlight & Sideload Build
+
+on:
+  push:
+    branches:
+      - ios
+      - main
+      - 'feature/**'
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build Configuration (Release or Debug)'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
+      upload_testflight:
+        description: 'Upload directly to Apple TestFlight (requires secrets)'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    name: Build Blender iOS & Package IPA
+    runs-on: macos-14
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Select Xcode Version
+        run: |
+          sudo xcode-select -s /Applications/Xcode_15.4.app || sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+
+      - name: Install Build Tools
+        run: |
+          brew install cmake ninja
+
+      - name: Cache Precompiled Dependencies
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            lib/ios_arm64
+            build_files/build_environment
+          key: ${{ runner.os }}-blender-ios-deps-${{ hashFiles('build_files/build_environment/cmake/*') }}
+          restore-keys: |
+            ${{ runner.os }}-blender-ios-deps-
+
+      - name: Build iOS Dependencies (if not cached)
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: |
+          echo "Building iOS dependencies via make deps ios..."
+          make deps ios || make deps ios
+
+      - name: Configure Apple Signing Certificate (if secrets provided)
+        if: env.APPLE_CERTIFICATE_BASE64 != ''
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_PROVISIONING_PROFILE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD || 'build_keychain_pass' }}
+        run: |
+          # Create temporary keychain
+          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import Distribution / Development Certificate
+          CERT_PATH=$RUNNER_TEMP/certificate.p12
+          echo -n "$APPLE_CERTIFICATE_BASE64" | base64 --decode -o "$CERT_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+          # Install Provisioning Profile
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo -n "$APPLE_PROVISIONING_PROFILE_BASE64" | base64 --decode -o ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
+
+      - name: Configure CMake for iOS
+        env:
+          BUILD_TYPE: ${{ github.event.inputs.build_type || 'Release' }}
+        run: |
+          mkdir -p build_ios
+          cmake -B build_ios -G Xcode \
+            -DAPPLE_TARGET_DEVICE=ios \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 \
+            -DWITH_APPLE_CROSSPLATFORM=ON \
+            -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+            -DWITH_CYCLES=ON \
+            -DWITH_METAL=ON
+
+      - name: Build and Archive with Xcode
+        env:
+          BUILD_TYPE: ${{ github.event.inputs.build_type || 'Release' }}
+          DEVELOPMENT_TEAM: ${{ secrets.APPLE_DEVELOPMENT_TEAM }}
+        run: |
+          if [ -n "$DEVELOPMENT_TEAM" ]; then
+            xcodebuild archive \
+              -project build_ios/Blender.xcodeproj \
+              -scheme blender \
+              -configuration ${BUILD_TYPE} \
+              -destination "generic/platform=iOS" \
+              -archivePath build_ios/Blender.xcarchive \
+              DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
+              CODE_SIGN_STYLE="Automatic"
+          else
+            echo "Building without explicit code signing for artifact export..."
+            xcodebuild archive \
+              -project build_ios/Blender.xcodeproj \
+              -scheme blender \
+              -configuration ${BUILD_TYPE} \
+              -destination "generic/platform=iOS" \
+              -archivePath build_ios/Blender.xcarchive \
+              CODE_SIGNING_ALLOWED="NO" \
+              CODE_SIGNING_REQUIRED="NO"
+          fi
+
+      - name: Generate ExportOptions.plist
+        run: |
+          cat << 'EOF' > build_ios/ExportOptions.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>app-store-connect</string>
+              <key>signingStyle</key>
+              <string>automatic</string>
+              <key>stripSwiftSymbols</key>
+              <true/>
+              <key>uploadSymbols</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Export .ipa Package
+        run: |
+          if [ -f "$RUNNER_TEMP/certificate.p12" ]; then
+            xcodebuild -exportArchive \
+              -archivePath build_ios/Blender.xcarchive \
+              -exportPath build_ios/export \
+              -exportOptionsPlist build_ios/ExportOptions.plist
+          else
+            echo "Creating un-signed/sideloadable IPA package from xcarchive payload..."
+            mkdir -p build_ios/export/Payload
+            cp -R build_ios/Blender.xcarchive/Products/Applications/Blender.app build_ios/export/Payload/
+            cd build_ios/export
+            zip -r Blender.ipa Payload
+          fi
+
+      - name: Upload .ipa to TestFlight
+        if: ${{ (github.event.inputs.upload_testflight == 'true' || github.event.inputs.upload_testflight == true || github.event_name == 'push') && env.APPSTORE_PRIVATE_KEY != '' }}
+        uses: apple-actions/upload-testflight-build@v5
+        env:
+          APPSTORE_PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+        with:
+          app-path: 'build_ios/export/Blender.ipa'
+          issuer-id: ${{ secrets.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ secrets.APPSTORE_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+
+      - name: Upload Build Artifacts (IPA & Archive)
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-ios-${{ github.sha }}
+          path: |
+            build_ios/export/*.ipa
+            build_ios/Blender.xcarchive
+          retention-days: 14
