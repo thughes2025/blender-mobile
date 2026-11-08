@@ -45,7 +45,11 @@ jobs:
 
       - name: Install Build Tools
         run: |
-          brew install cmake ninja
+          brew install autoconf automake bison dos2unix flex libtool meson ninja pkg-config yasm cmake
+          # Ensure bison and flex are in PATH
+          echo "/opt/homebrew/opt/bison/bin" >> $GITHUB_PATH
+          echo "/opt/homebrew/opt/flex/bin" >> $GITHUB_PATH
+          echo "/opt/homebrew/opt/libtool/bin" >> $GITHUB_PATH
 
       - name: Cache Precompiled Dependencies
         id: cache-deps
